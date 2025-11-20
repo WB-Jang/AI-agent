@@ -1,0 +1,5 @@
+langchain>=0.0.300
+pypdf>=3.8.0
+openai>=0.27.0
+langgraph>=0.1.0
+# Add your preferred LLM SDKs if using them (e.g., transformers, sentence-transformers)
