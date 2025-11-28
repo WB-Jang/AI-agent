@@ -1,6 +1,9 @@
 import os
 from docx2pdf import convert
 from pypdf import PdfWriter
+import win32com
+from win32com.client import gencache
+import shutil
 
 def get_word_files(folder_path):
     """폴더 내의 .docx 및 .doc 파일 리스트를 반환"""
@@ -75,6 +78,25 @@ def convert_and_merge_to_one_pdf(folder_path, output_path, merged_filename="Merg
             os.remove(temp_path)
     print("[정리 완료] 임시 PDF 파일들을 삭제했습니다.")
 
+def cleanup_gen_py():
+    """win32com gen_py 캐시 폴더 자동 삭제"""
+    paths = set()
+    gen_attr =getattr(win32com, "__gen_path__", None)
+    if gen_attr:
+        paths.add(gen_attr)
+        try:
+            gen_path = gencache.GetGeneratePath()
+            if gen_path:
+                paths.add(gen_path)
+        except Exception:
+            pass
+    for p in paths:
+        if p and os.path.isdir(p):
+            try:
+                print(f"[cleanup_gen_py] 삭제 시도: {p}")
+                shutil.rmtree(p, ignore_errors=True)
+            except Exception as e:
+                print(f"[cleanup_gen_py] 삭제 실패: {p} -> {e}")
 # --- 사용 예시 ---
 if __name__ == "__main__":
     # Word 파일들이 들어있는 폴더 경로 (경로를 본인 환경에 맞게 수정하세요)
@@ -92,3 +114,8 @@ if __name__ == "__main__":
     # 2. 하나의 PDF로 합치기
     print("--- [2] 통합 PDF 생성 시작 ---")
     convert_and_merge_to_one_pdf(target_folder, out_folder, "최종보고서_통합.pdf")
+    # 3. cache 삭제
+    cleanup_gen_py()
+    print('====gen_py cache 삭제 완료====')
+
+
