@@ -5,10 +5,62 @@ import win32com
 from win32com.client import gencache
 import shutil
 
+# PPT 변환을 위한 상수 (PowerPoint SaveAs PDF format code)
+ppSaveAsPDF = 32
+
 def get_word_files(folder_path):
-    """폴더 내의 .docx 및 .doc 파일 리스트를 반환"""
-    files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.docx', '.doc')) and not f.startswith('~$')]
+    """폴더 내의 .docx/.doc/.pptx/.ppt 파일 리스트를 반환"""
+    extensions = ('.docx', '.doc', '.pptx', '.ppt')
+    files = [f for f in os.listdir(folder_path) if f.lower().endswith(extensions) and not f.startswith('~$')]
     return sorted(files) 
+
+def convert_ppt_to_pdf(input_path, output_path):
+    """
+    win32com을 사용하여 PPT를 PDF로 변환하는 함수
+    """
+    powerpoint = None
+    presentation = None
+    try:
+        # PowerPoint 어플리케이션 실행 (백그라운드)
+        powerpoint = win32com.client.Dispatch("PowerPoint.Application")
+        
+        # 파일 열기 (WithWindow=False로 창 숨김 시도)
+        presentation = powerpoint.Presentations.Open(input_path, WithWindow=False)
+        
+        # PDF로 저장
+        presentation.SaveAs(output_path, FileFormat=ppSaveAsPDF)
+        return True
+    except Exception as e:
+        print(f"[PPT 변환 에러] {e}")
+        return False
+    finally:
+        # 자원 해제
+        if presentation:
+            presentation.Close()
+        if powerpoint:
+            # 주의: 다른 PPT 창이 열려있을 수도 있으므로 Quit은 신중 
+            # 배치 작업에서는 깔끔하게 종료하는 것이 메모리 효율 좋음
+            # 실행 중인 다른 PPT가 있다면 Quit()을 제외하거나 카운트를 체크.
+            try:
+                if powerpoint.Presentations.Count == 0:
+                    powerpoint.Quit()
+            except:
+                pass
+
+def convert_to_pdf_wrapper(input_path, output_path):
+    """파일 확장자에 따라 적절한 변환 도구를 호출하는 래퍼 함수"""
+    ext = os.path.splitext(input_path)[1].lower()
+    
+    if ext in ['.docx', '.doc']:
+        # Word는 기존 docx2pdf 사용
+        convert(input_path, output_path)
+    elif ext in ['.pptx', '.ppt']:
+        # PPT는 win32com 사용
+        success = convert_ppt_to_pdf(input_path, output_path)
+        if not success:
+            raise Exception("PowerPoint conversion failed via win32com")
+    else:
+        raise Exception(f"지원하지 않는 확장자입니다: {ext}")
 
 def convert_each_to_pdf(folder_path, output_path, output_folder=None):
     """
@@ -20,19 +72,18 @@ def convert_each_to_pdf(folder_path, output_path, output_folder=None):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    word_files = get_word_files(folder_path)
+    target_files = get_files(folder_path)
     
-    print(f"총 {len(word_files)}개의 파일을 개별 PDF로 변환합니다...")
+    print(f"총 {len(target_files)}개의 파일을 개별 PDF로 변환합니다...")
     
-    for file in word_files:
+    for file in target_files:
         input_path = os.path.join(folder_path, file)
         # 확장자만 .pdf로 변경
         output_filename = os.path.splitext(file)[0] + ".pdf"
         output_path = os.path.join(output_folder, output_filename)
         
         try:
-            # docx2pdf를 사용하여 변환 (MS Word 엔진 사용으로 서식 유지)
-            convert(input_path, output_path)
+            convert_to_pdf_wrapper(input_path, output_path)
             print(f"[완료] {file} -> {output_filename}")
         except Exception as e:
             print(f"[에러] {file} 변환 실패: {e}")
@@ -42,14 +93,14 @@ def convert_and_merge_to_one_pdf(folder_path, output_path, merged_filename="Merg
     기능 2: 여러 Word 파일을 형식 변형 없이 하나의 PDF 파일로 합쳐서 저장
     (전략: 개별 PDF 변환 -> PDF 병합 -> 임시 파일 삭제 옵션)
     """
-    word_files = get_word_files(folder_path)
+    target_files = get_files(folder_path)
     merger = PdfWriter()
     temp_pdf_list = []
 
-    print(f"총 {len(word_files)}개의 파일을 하나로 병합하기 위해 변환을 시작합니다...")
+    print(f"총 {len(target_files)}개의 파일을 하나로 병합하기 위해 변환을 시작합니다...")
 
     # 1단계: Word -> 개별 PDF 변환 (임시)
-    for file in word_files:
+    for file in target_files:
         input_path = os.path.join(folder_path, file)
         temp_pdf_name = os.path.splitext(file)[0] + "_temp.pdf"
         temp_pdf_path = os.path.join(output_path, temp_pdf_name)
