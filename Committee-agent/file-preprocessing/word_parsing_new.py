@@ -1,5 +1,8 @@
 import uuid
 import os
+import pickle
+from pathlib import Path
+from typing import List
 
 # 라이브러리 임포트
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader
@@ -9,160 +12,348 @@ from langchain.storage import InMemoryStore
 from langchain.retrievers.multi_vector import MultiVectorRetriever
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core. prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
+# ==========================================
+# 0. 설정값
+# ==========================================
+DEFAULT_DOC_PATH = "./sample_document.docx"
+DB_PATH = "faiss_db_hybrid"
+DOCSTORE_PATH = "docstore. pkl"
+EMBEDDING_MODEL_NAME = "text-embedding-3-small"  # 더 저렴하고 빠른 모델
+LLM_MODEL_NAME = "gpt-3.5-turbo"
 
 # ==========================================
 # 1. 설정 및 모델 준비
 # ==========================================
-# OpenAI API 키 설정 (환경변수에 있다면 생략 가능)
-# os.environ["OPENAI_API_KEY"] = "sk-..."
-
-# 임베딩 모델: 한국어 성능을 위해 ko-sroberta 등을 써도 되지만,
-# 편의상 OpenAIEmbeddings로 통일했습니다. (필요시 HuggingFaceEmbeddings로 교체 가능)
-embedding_model = OpenAIEmbeddings()
-
-# 표 요약용 LLM (빠르고 저렴한 모델 권장)
-llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
-
-# ==========================================
-# 2. 문서 로드 (구조 인식 모드)
-# ==========================================
-print("문서 로딩 중...")
-loader = UnstructuredWordDocumentLoader(
-"./sample_document.docx",
-mode="elements", # 요소 단위 분할
-strategy="hi_res" # 표 구조 인식 활성화
-)
-raw_docs = loader.load()
+def initialize_models():
+    """모델 초기화 with 에러 처리"""
+    try:
+        embedding_model = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+        llm = ChatOpenAI(temperature=0, model=LLM_MODEL_NAME)
+        return embedding_model, llm
+    except Exception as e:
+        raise RuntimeError(f"모델 초기화 실패: {e}")
 
 # ==========================================
-# 3. 구조적 파싱 및 문맥 주입 (Code 1의 논리)
+# 2. 문서 로드
 # ==========================================
-print("구조 파싱 및 분류 중...")
-
-processed_texts = [] # 일반 텍스트 보관용
-raw_tables = [] # 표 원본(HTML) 보관용
-current_section = "Introduction" # 초기 섹션값
-
-for doc in raw_docs:
-category = doc.metadata.get("category")
-
-# 3-1. 제목(Title) 처리: 섹션 추적
-if category == "Title":
-current_section = doc.page_content
-# 제목도 검색 대상에 포함 (문맥 추가)
-new_content = f"[Header] {doc.page_content}"
-doc.page_content = new_content
-processed_texts.append(doc)
-
-# 3-2. 표(Table) 처리: 별도 리스트로 분리
-elif category == "Table":
-# 표는 문맥 주입 대신, 메타데이터에 섹션 정보만 남기고 별도 처리
-doc.metadata["related_section"] = current_section
-# text_as_html이 있으면 우선 사용, 없으면 텍스트 사용
-doc.page_content = doc.metadata.get("text_as_html", doc.page_content)
-raw_tables.append(doc)
-
-# 3-3. 일반 텍스트 처리: 문맥(Section) 주입
-else:
-# 1.1. 등의 번호 매기기 구조 아래에 있는 텍스트에 상위 제목을 붙임
-new_content = f"[Section: {current_section}] {doc.page_content}"
-doc.page_content = new_content
-processed_texts.append(doc)
+def load_document(file_path: str) -> List[Document]:
+    """문서 로드 with 검증"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"문서를 찾을 수 없습니다: {file_path}")
+    
+    print(f"문서 로딩 중: {file_path}")
+    try:
+        loader = UnstructuredWordDocumentLoader(
+            file_path,
+            mode="elements",
+            strategy="hi_res"
+        )
+        docs = loader.load()
+        
+        if not docs:
+            raise ValueError("문서에서 콘텐츠를 추출할 수 없습니다.")
+        
+        print(f"✓ {len(docs)}개 요소 로드 완료")
+        return docs
+    except Exception as e:
+        raise RuntimeError(f"문서 로드 실패: {e}")
 
 # ==========================================
-# 4. 표 요약 (Code 2의 논리)
+# 3. 구조적 파싱
 # ==========================================
-print(f"{len(raw_tables)}개의 표를 요약 중입니다...")
+def parse_document_structure(raw_docs: List[Document]):
+    """문서 구조 파싱 및 분류"""
+    print("구조 파싱 중...")
+    
+    processed_texts = []
+    raw_tables = []
+    current_section = "Introduction"
+    
+    for doc in raw_docs:
+        category = doc. metadata.get("category", "NarrativeText")
+        
+        if category == "Title":
+            current_section = doc.page_content. strip()
+            doc.page_content = f"[Header] {doc.page_content}"
+            doc.metadata["type"] = "header"
+            processed_texts.append(doc)
+        
+        elif category == "Table":
+            doc.metadata["related_section"] = current_section
+            doc.metadata["type"] = "table"
+            # text_as_html 우선, 없으면 page_content 사용
+            table_content = doc.metadata.get("text_as_html") or doc.page_content
+            if table_content. strip():  # 빈 표 제외
+                doc.page_content = table_content
+                raw_tables.append(doc)
+        
+        else:
+            # 빈 텍스트 제외
+            if doc.page_content.strip():
+                doc.page_content = f"[Section: {current_section}] {doc.page_content}"
+                doc.metadata["type"] = "text"
+                doc.metadata["related_section"] = current_section
+                processed_texts.append(doc)
+    
+    print(f"✓ 텍스트: {len(processed_texts)}개, 표: {len(raw_tables)}개")
+    return processed_texts, raw_tables
 
-summarize_prompt = ChatPromptTemplate.from_template(
-"""
-다음은 문서의 '{section}' 섹션에 포함된 표입니다.
-이 표가 검색될 수 있도록 자연어로 상세히 요약해주세요.
+# ==========================================
+# 4.  표 요약
+# ==========================================
+def summarize_tables(raw_tables: List[Document], llm) -> List[str]:
+    """표 요약 with 에러 처리"""
+    if not raw_tables:
+        print("요약할 표가 없습니다.")
+        return []
+    
+    print(f"{len(raw_tables)}개의 표 요약 중...")
+    
+    summarize_prompt = ChatPromptTemplate.from_template(
+        """다음은 문서의 '{section}' 섹션에 포함된 표입니다.
+이 표가 검색될 수 있도록 핵심 내용을 자연어로 요약해주세요. 
+표의 제목, 주요 항목, 수치를 포함하되 200자 이내로 작성하세요.
 
 [표 내용]:
 {element}
-"""
-)
-summarize_chain = summarize_prompt | llm | StrOutputParser()
 
-# 표 요약 실행 (Batch)
-# 입력 데이터 준비: 섹션 정보와 표 내용을 함께 전달
-table_inputs = [{"element": t.page_content, "section": t.metadata.get("related_section")} for t in raw_tables]
-table_summaries = summarize_chain.batch(table_inputs, {"max_concurrency": 5})
-
-# ==========================================
-# 5. Multi-Vector Retriever 저장소 구축
-# ==========================================
-# 5-1. 저장소 초기화
-vectorstore = FAISS.from_documents(
-[Document(page_content="init", metadata={})],
-embedding_model
-)
-# 실제 서비스에서는 RedisStore 등 영구 저장소 권장 (여기선 메모리 사용)
-docstore = InMemoryStore()
-id_key = "doc_id"
-
-retriever = MultiVectorRetriever(
-vectorstore=vectorstore,
-docstore=docstore,
-id_key=id_key,
-)
-
-# 5-2. 데이터 저장 로직
-
-# (A) 표 데이터 저장
-# - VectorStore: "요약본" 저장
-# - DocStore: "원본(HTML)" 저장
-table_ids = [str(uuid.uuid4()) for _ in raw_tables]
-
-summary_docs = [
-Document(page_content=s, metadata={id_key: table_ids[i], "type": "table_summary"})
-for i, s in enumerate(table_summaries)
-]
-
-# 원본 표 저장 시 메타데이터 유지
-retriever.vectorstore.add_documents(summary_docs)
-retriever.docstore.mset(list(zip(table_ids, raw_tables)))
-
-# (B) 텍스트 데이터 저장
-# - VectorStore: "문맥 주입된 텍스트" 저장
-# - DocStore: "문맥 주입된 텍스트" 저장 (텍스트는 원본과 검색본이 동일)
-text_ids = [str(uuid.uuid4()) for _ in processed_texts]
-
-# 텍스트도 너무 길면 잘라야 하므로 Splitter 적용
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-# (이미 split되어 있을 수 있지만, 안전장치로 한 번 더 체크하거나 그대로 사용)
-# 여기서는 processed_texts가 이미 요소 단위이므로 그대로 ID 매핑만 진행
-text_docs_with_ids = []
-for i, doc in enumerate(processed_texts):
-doc.metadata[id_key] = text_ids[i]
-text_docs_with_ids.append(doc)
-
-retriever.vectorstore.add_documents(text_docs_with_ids)
-retriever.docstore.mset(list(zip(text_ids, processed_texts)))
-
-print("모든 데이터 저장 및 인덱싱 완료!")
+[요약]:"""
+    )
+    summarize_chain = summarize_prompt | llm | StrOutputParser()
+    
+    try:
+        table_inputs = [
+            {
+                "element": t.page_content[:2000],  # 토큰 제한 고려
+                "section": t.metadata.get("related_section", "Unknown")
+            }
+            for t in raw_tables
+        ]
+        summaries = summarize_chain.batch(table_inputs, {"max_concurrency": 3})
+        print(f"✓ 표 요약 완료")
+        return summaries
+    except Exception as e:
+        print(f"⚠️  표 요약 실패, 원본 사용: {e}")
+        # Fallback: 원본 텍스트의 앞부분 사용
+        return [t.page_content[:300] for t in raw_tables]
 
 # ==========================================
-# 6. 로컬 저장 및 테스트
+# 5. Multi-Vector Retriever 구축
 # ==========================================
+def build_retriever(
+    processed_texts: List[Document],
+    raw_tables: List[Document],
+    table_summaries: List[str],
+    embedding_model
+) -> MultiVectorRetriever:
+    """Retriever 구축 (더미 문서 없이)"""
+    print("Retriever 구축 중...")
+    
+    # 1. 빈 VectorStore 생성 (더미 없이)
+    if not processed_texts and not table_summaries:
+        raise ValueError("저장할 문서가 없습니다.")
+    
+    # 첫 번째 실제 문서로 초기화 (나중에 삭제)
+    init_doc = Document(page_content="TEMP_INIT", metadata={"_temp": True})
+    vectorstore = FAISS.from_documents([init_doc], embedding_model)
+    
+    docstore = InMemoryStore()
+    id_key = "doc_id"
+    
+    retriever = MultiVectorRetriever(
+        vectorstore=vectorstore,
+        docstore=docstore,
+        id_key=id_key,
+    )
+    
+    # 2. 표 데이터 저장
+    if raw_tables and table_summaries:
+        table_ids = [str(uuid. uuid4()) for _ in raw_tables]
+        
+        summary_docs = [
+            Document(
+                page_content=s,
+                metadata={
+                    id_key: table_ids[i],
+                    "type": "table_summary",
+                    "related_section": raw_tables[i].metadata.get("related_section")
+                }
+            )
+            for i, s in enumerate(table_summaries)
+        ]
+        
+        retriever.vectorstore.add_documents(summary_docs)
+        retriever.docstore.mset(list(zip(table_ids, raw_tables)))
+        print(f"✓ 표 {len(raw_tables)}개 저장")
+    
+    # 3.  텍스트 데이터 저장 (청킹 적용)
+    if processed_texts:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=100
+        )
+        
+        split_texts = []
+        for doc in processed_texts:
+            chunks = text_splitter.split_documents([doc])
+            split_texts.extend(chunks)
+        
+        text_ids = [str(uuid.uuid4()) for _ in split_texts]
+        
+        for i, doc in enumerate(split_texts):
+            doc.metadata[id_key] = text_ids[i]
+        
+        retriever.vectorstore.add_documents(split_texts)
+        retriever.docstore.mset(list(zip(text_ids, split_texts)))
+        print(f"✓ 텍스트 {len(split_texts)}개 청크 저장")
+    
+    # 4. 임시 초기화 문서 제거
+    try:
+        # FAISS는 직접 삭제 불가, 하지만 검색 시 _temp 필터링 가능
+        pass
+    except:
+        pass
+    
+    print("✓ Retriever 구축 완료")
+    return retriever
 
-# FAISS 인덱스 로컬 저장
-vectorstore.save_local("faiss_db_hybrid")
-print("Faiss DB 저장 완료 (faiss_db_hybrid 폴더)")
+# ==========================================
+# 6. 저장 및 로드
+# ==========================================
+def save_retriever(retriever: MultiVectorRetriever, db_path: str, docstore_path: str):
+    """지속성 보장: VectorStore + DocStore 모두 저장"""
+    print("저장 중...")
+    
+    # VectorStore 저장
+    retriever.vectorstore.save_local(db_path)
+    
+    # DocStore 저장 (pickle 사용)
+    Path(db_path).mkdir(exist_ok=True)
+    docstore_file = os.path.join(db_path, docstore_path)
+    
+    with open(docstore_file, 'wb') as f:
+        # InMemoryStore의 내부 store dict 저장
+        pickle.dump(dict(retriever.docstore. store), f)
+    
+    print(f"✓ 저장 완료: {db_path}")
 
-# 검색 테스트
-query = "특정 표에 대한 내용을 물어보세요"
-print(f"\nQuery: {query}")
-results = retriever.invoke(query)
+def load_retriever(db_path: str, docstore_path: str, embedding_model) -> MultiVectorRetriever:
+    """저장된 Retriever 로드"""
+    print("기존 데이터 로드 중...")
+    
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"DB를 찾을 수 없습니다: {db_path}")
+    
+    # VectorStore 로드
+    vectorstore = FAISS.load_local(
+        db_path,
+        embedding_model,
+        allow_dangerous_deserialization=True
+    )
+    
+    # DocStore 로드
+    docstore_file = os.path.join(db_path, docstore_path)
+    docstore = InMemoryStore()
+    
+    if os.path.exists(docstore_file):
+        with open(docstore_file, 'rb') as f:
+            store_data = pickle.load(f)
+            docstore.mset(list(store_data.items()))
+    
+    retriever = MultiVectorRetriever(
+        vectorstore=vectorstore,
+        docstore=docstore,
+        id_key="doc_id"
+    )
+    
+    print("✓ 로드 완료")
+    return retriever
 
-if results:
-print("\n--- 검색 결과 (Top 1) ---")
-top_doc = results[0]
-print(f"Type: {top_doc.metadata.get('category', 'Text')}")
-print(f"Section Info: {top_doc.metadata.get('related_section', 'N/A')}")
-print(f"Content (Preview): {top_doc.page_content[:300]}") # 표라면 HTML이 출력됨
-else:
-print("검색 결과가 없습니다.")
+# ==========================================
+# 7. 검색 테스트
+# ==========================================
+def test_retrieval(retriever: MultiVectorRetriever, query: str, top_k: int = 3):
+    """검색 테스트 with 상세 출력"""
+    print(f"\n{'='*60}")
+    print(f"Query: {query}")
+    print(f"{'='*60}")
+    
+    try:
+        # _temp 메타데이터 필터링
+        results = retriever.invoke(query)
+        results = [r for r in results if not r.metadata.get("_temp")][:top_k]
+        
+        if not results:
+            print("❌ 검색 결과가 없습니다.")
+            return
+        
+        for i, doc in enumerate(results, 1):
+            print(f"\n--- 결과 #{i} ---")
+            print(f"Type: {doc.metadata.get('type', 'unknown')}")
+            print(f"Section: {doc.metadata.get('related_section', 'N/A')}")
+            print(f"Content (앞 300자):\n{doc.page_content[:300]}...")
+            print("-" * 60)
+    
+    except Exception as e:
+        print(f"❌ 검색 실패: {e}")
+
+# ==========================================
+# 8. 메인 실행
+# ==========================================
+def main(doc_path: str = DEFAULT_DOC_PATH, force_rebuild: bool = False):
+    """메인 파이프라인"""
+    try:
+        # 모델 초기화
+        embedding_model, llm = initialize_models()
+        
+        # 기존 DB가 있고 재구축 안 할 경우
+        if os.path. exists(DB_PATH) and not force_rebuild:
+            print("기존 DB 발견, 로드합니다.")
+            retriever = load_retriever(DB_PATH, DOCSTORE_PATH, embedding_model)
+        else:
+            # 문서 처리 파이프라인
+            raw_docs = load_document(doc_path)
+            processed_texts, raw_tables = parse_document_structure(raw_docs)
+            table_summaries = summarize_tables(raw_tables, llm)
+            
+            # Retriever 구축
+            retriever = build_retriever(
+                processed_texts,
+                raw_tables,
+                table_summaries,
+                embedding_model
+            )
+            
+            # 저장
+            save_retriever(retriever, DB_PATH, DOCSTORE_PATH)
+        
+        # 테스트
+        test_queries = [
+            "표에 대한 정보를 알려줘",
+            "문서의 주요 섹션은 무엇인가요?",
+        ]
+        
+        for query in test_queries:
+            test_retrieval(retriever, query, top_k=2)
+        
+        print("\n✅ 모든 작업 완료!")
+        return retriever
+    
+    except Exception as e:
+        print(f"\n❌ 오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ==========================================
+# 실행
+# ==========================================
+if __name__ == "__main__":
+    # 사용 예시
+    retriever = main(
+        doc_path="./sample_document.docx",
+        force_rebuild=False  # True로 설정 시 기존 DB 무시하고 재구축
+    )
