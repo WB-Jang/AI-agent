@@ -2,7 +2,10 @@ import uuid
 import os
 import pickle
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+import requests
+import numpy as np
+import json
 
 # 라이브러리 임포트
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader
@@ -12,25 +15,94 @@ from langchain.storage import InMemoryStore
 from langchain.retrievers.multi_vector import MultiVectorRetriever
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core. prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.embeddings import Embeddings
 
 # ==========================================
 # 0. 설정값
 # ==========================================
 DEFAULT_DOC_PATH = "./sample_document.docx"
+DEFAULT_FOLDER_PATH = None  # 폴더 경로 (None이면 단일 파일 모드)
 DB_PATH = "faiss_db_hybrid"
-DOCSTORE_PATH = "docstore. pkl"
+DOCSTORE_PATH = "docstore.pkl"
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"  # 더 저렴하고 빠른 모델
 LLM_MODEL_NAME = "gpt-3.5-turbo"
+USE_LOCAL_EMBEDDING = False  # True로 설정 시 로컬 서버 사용
+LOCAL_EMBEDDING_SERVER = "http://127.0.0.1:8081"  # 로컬 임베딩 서버 주소
+
+# ==========================================
+# 로컬 임베딩 모델 클래스 (from _faiss.py)
+# ==========================================
+class LocalEmbeddings(Embeddings):
+    """로컬 llama-server를 사용한 임베딩 모델"""
+    
+    def __init__(self, server_url: str = LOCAL_EMBEDDING_SERVER):
+        self.server_url = server_url
+    
+    def _embed_text(self, texts: List[str]) -> np.ndarray:
+        """
+        llama-server의 /v1/embeddings 엔드포인트를 사용해 bge-m3.gguf 임베딩 진행
+        반환 결과 : (N, D) float32 numpy array
+        """
+        out = []
+        for t in texts:
+            vecs = None 
+            try:
+                r = requests.post(
+                    f"{self.server_url}/v1/embeddings", 
+                    json={"model": "bge-m3", "input": t}, 
+                    timeout=45
+                )
+                if r.ok and "data" in r.json():
+                    vecs = r.json()["data"][0]["embedding"]
+                    v = np.array(vecs, dtype=np.float32)
+                    v /= (np.linalg.norm(v) + 1e-12)  # 정규화
+                    out.append(v)
+            except Exception as e:
+                print(f"⚠️ 임베딩 실패: {e}")
+                pass
+        
+        if not out:
+            raise RuntimeError(f"임베딩 API 실패: {texts[:100]}")
+        
+        return np.vstack(out).astype("float32")
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """LangChain 인터페이스 구현"""
+        embeddings = self._embed_text(texts)
+        return embeddings.tolist()
+    
+    def embed_query(self, text: str) -> List[float]:
+        """LangChain 인터페이스 구현"""
+        embedding = self._embed_text([text])
+        return embedding[0].tolist()
+
+# ==========================================
+# 파일 탐색 기능 (from word2pdf.py)
+# ==========================================
+def get_word_files(folder_path: str) -> List[str]:
+    """폴더 내의 .docx/.doc 파일 리스트를 반환"""
+    extensions = ('.docx', '.doc')
+    files = [
+        f for f in os.listdir(folder_path) 
+        if f.lower().endswith(extensions) and not f.startswith('~$')
+    ]
+    return sorted(files)
 
 # ==========================================
 # 1. 설정 및 모델 준비
 # ==========================================
-def initialize_models():
+def initialize_models(use_local: bool = USE_LOCAL_EMBEDDING):
     """모델 초기화 with 에러 처리"""
     try:
-        embedding_model = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+        if use_local:
+            print("로컬 임베딩 서버 사용")
+            embedding_model = LocalEmbeddings(server_url=LOCAL_EMBEDDING_SERVER)
+        else:
+            print("OpenAI 임베딩 사용")
+            embedding_model = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+        
         llm = ChatOpenAI(temperature=0, model=LLM_MODEL_NAME)
         return embedding_model, llm
     except Exception as e:
@@ -73,10 +145,10 @@ def parse_document_structure(raw_docs: List[Document]):
     current_section = "Introduction"
     
     for doc in raw_docs:
-        category = doc. metadata.get("category", "NarrativeText")
+        category = doc.metadata.get("category", "NarrativeText")
         
         if category == "Title":
-            current_section = doc.page_content. strip()
+            current_section = doc.page_content.strip()
             doc.page_content = f"[Header] {doc.page_content}"
             doc.metadata["type"] = "header"
             processed_texts.append(doc)
@@ -86,7 +158,7 @@ def parse_document_structure(raw_docs: List[Document]):
             doc.metadata["type"] = "table"
             # text_as_html 우선, 없으면 page_content 사용
             table_content = doc.metadata.get("text_as_html") or doc.page_content
-            if table_content. strip():  # 빈 표 제외
+            if table_content.strip():  # 빈 표 제외
                 doc.page_content = table_content
                 raw_tables.append(doc)
         
@@ -171,7 +243,7 @@ def build_retriever(
     
     # 2. 표 데이터 저장
     if raw_tables and table_summaries:
-        table_ids = [str(uuid. uuid4()) for _ in raw_tables]
+        table_ids = [str(uuid.uuid4()) for _ in raw_tables]
         
         summary_docs = [
             Document(
@@ -236,7 +308,7 @@ def save_retriever(retriever: MultiVectorRetriever, db_path: str, docstore_path:
     
     with open(docstore_file, 'wb') as f:
         # InMemoryStore의 내부 store dict 저장
-        pickle.dump(dict(retriever.docstore. store), f)
+        pickle.dump(dict(retriever.docstore.store), f)
     
     print(f"✓ 저장 완료: {db_path}")
 
@@ -301,46 +373,157 @@ def test_retrieval(retriever: MultiVectorRetriever, query: str, top_k: int = 3):
         print(f"❌ 검색 실패: {e}")
 
 # ==========================================
-# 8. 메인 실행
+# 8. 배치 처리 기능 (폴더 내 여러 파일 처리)
 # ==========================================
-def main(doc_path: str = DEFAULT_DOC_PATH, force_rebuild: bool = False):
-    """메인 파이프라인"""
+def process_folder(
+    folder_path: str, 
+    embedding_model,
+    llm,
+    db_base_path: str = "faiss_db_batch",
+    force_rebuild: bool = False
+) -> dict:
+    """
+    폴더 내 모든 Word 문서를 처리하고 각각의 retriever를 생성
+    
+    Returns:
+        dict: {filename: retriever} 매핑
+    """
+    print(f"\n{'='*60}")
+    print(f"폴더 처리 시작: {folder_path}")
+    print(f"{'='*60}\n")
+    
+    # 폴더 내 파일 목록 가져오기
+    files = get_word_files(folder_path)
+    
+    if not files:
+        print("처리할 문서가 없습니다.")
+        return {}
+    
+    print(f"총 {len(files)}개의 문서를 처리합니다.")
+    
+    retrievers = {}
+    
+    for i, file in enumerate(files, 1):
+        print(f"\n[{i}/{len(files)}] 처리 중: {file}")
+        
+        try:
+            file_path = os.path.join(folder_path, file)
+            
+            # 파일별 DB 경로 설정
+            file_base_name = os.path.splitext(file)[0]
+            db_path = f"{db_base_path}_{file_base_name}"
+            docstore_path = "docstore.pkl"
+            
+            # 기존 DB가 있고 재구축 안 할 경우
+            if os.path.exists(db_path) and not force_rebuild:
+                print(f"  기존 DB 발견, 로드합니다: {db_path}")
+                retriever = load_retriever(db_path, docstore_path, embedding_model)
+            else:
+                # 문서 처리 파이프라인
+                raw_docs = load_document(file_path)
+                processed_texts, raw_tables = parse_document_structure(raw_docs)
+                table_summaries = summarize_tables(raw_tables, llm)
+                
+                # Retriever 구축
+                retriever = build_retriever(
+                    processed_texts,
+                    raw_tables,
+                    table_summaries,
+                    embedding_model
+                )
+                
+                # 저장
+                save_retriever(retriever, db_path, docstore_path)
+            
+            retrievers[file] = retriever
+            print(f"  ✓ 완료: {file}")
+        
+        except Exception as e:
+            print(f"  ❌ 실패: {file} - {e}")
+            continue
+    
+    print(f"\n{'='*60}")
+    print(f"배치 처리 완료: {len(retrievers)}/{len(files)} 성공")
+    print(f"{'='*60}\n")
+    
+    return retrievers
+
+# ==========================================
+# 9. 메인 실행
+# ==========================================
+def main(
+    doc_path: Optional[str] = DEFAULT_DOC_PATH, 
+    folder_path: Optional[str] = DEFAULT_FOLDER_PATH,
+    force_rebuild: bool = False,
+    use_local: bool = USE_LOCAL_EMBEDDING
+):
+    """
+    메인 파이프라인
+    
+    Args:
+        doc_path: 단일 문서 경로 (folder_path가 None일 때 사용)
+        folder_path: 폴더 경로 (지정 시 폴더 내 모든 문서 처리)
+        force_rebuild: True면 기존 DB 무시하고 재구축
+        use_local: True면 로컬 임베딩 서버 사용
+    """
     try:
         # 모델 초기화
-        embedding_model, llm = initialize_models()
+        embedding_model, llm = initialize_models(use_local=use_local)
         
-        # 기존 DB가 있고 재구축 안 할 경우
-        if os.path. exists(DB_PATH) and not force_rebuild:
-            print("기존 DB 발견, 로드합니다.")
-            retriever = load_retriever(DB_PATH, DOCSTORE_PATH, embedding_model)
-        else:
-            # 문서 처리 파이프라인
-            raw_docs = load_document(doc_path)
-            processed_texts, raw_tables = parse_document_structure(raw_docs)
-            table_summaries = summarize_tables(raw_tables, llm)
-            
-            # Retriever 구축
-            retriever = build_retriever(
-                processed_texts,
-                raw_tables,
-                table_summaries,
-                embedding_model
+        # 폴더 모드 vs 단일 파일 모드
+        if folder_path:
+            # 폴더 내 모든 문서 처리
+            retrievers = process_folder(
+                folder_path, 
+                embedding_model, 
+                llm,
+                force_rebuild=force_rebuild
             )
             
-            # 저장
-            save_retriever(retriever, DB_PATH, DOCSTORE_PATH)
+            # 각 문서에 대해 테스트
+            test_query = "표에 대한 정보를 알려줘"
+            for filename, retriever in retrievers.items():
+                print(f"\n{'='*60}")
+                print(f"문서: {filename}")
+                print(f"{'='*60}")
+                test_retrieval(retriever, test_query, top_k=2)
+            
+            print("\n✅ 모든 작업 완료!")
+            return retrievers
         
-        # 테스트
-        test_queries = [
-            "표에 대한 정보를 알려줘",
-            "문서의 주요 섹션은 무엇인가요?",
-        ]
-        
-        for query in test_queries:
-            test_retrieval(retriever, query, top_k=2)
-        
-        print("\n✅ 모든 작업 완료!")
-        return retriever
+        else:
+            # 단일 문서 처리 (기존 로직)
+            if os.path.exists(DB_PATH) and not force_rebuild:
+                print("기존 DB 발견, 로드합니다.")
+                retriever = load_retriever(DB_PATH, DOCSTORE_PATH, embedding_model)
+            else:
+                # 문서 처리 파이프라인
+                raw_docs = load_document(doc_path)
+                processed_texts, raw_tables = parse_document_structure(raw_docs)
+                table_summaries = summarize_tables(raw_tables, llm)
+                
+                # Retriever 구축
+                retriever = build_retriever(
+                    processed_texts,
+                    raw_tables,
+                    table_summaries,
+                    embedding_model
+                )
+                
+                # 저장
+                save_retriever(retriever, DB_PATH, DOCSTORE_PATH)
+            
+            # 테스트
+            test_queries = [
+                "표에 대한 정보를 알려줘",
+                "문서의 주요 섹션은 무엇인가요?",
+            ]
+            
+            for query in test_queries:
+                test_retrieval(retriever, query, top_k=2)
+            
+            print("\n✅ 모든 작업 완료!")
+            return retriever
     
     except Exception as e:
         print(f"\n❌ 오류 발생: {e}")
@@ -352,8 +535,33 @@ def main(doc_path: str = DEFAULT_DOC_PATH, force_rebuild: bool = False):
 # 실행
 # ==========================================
 if __name__ == "__main__":
-    # 사용 예시
+    # 사용 예시 1: 단일 파일 처리
+    # retriever = main(
+    #     doc_path="./sample_document.docx",
+    #     folder_path=None,
+    #     force_rebuild=False,
+    #     use_local=False  # OpenAI 임베딩 사용
+    # )
+    
+    # 사용 예시 2: 폴더 내 모든 파일 처리
+    # retrievers = main(
+    #     folder_path="./documents",
+    #     force_rebuild=False,
+    #     use_local=False  # OpenAI 임베딩 사용
+    # )
+    
+    # 사용 예시 3: 로컬 임베딩 서버 사용
+    # retriever = main(
+    #     doc_path="./sample_document.docx",
+    #     folder_path=None,
+    #     force_rebuild=False,
+    #     use_local=True  # 로컬 임베딩 서버 사용 (포트 8081)
+    # )
+    
+    # 기본 실행: 단일 파일 + OpenAI 임베딩
     retriever = main(
         doc_path="./sample_document.docx",
-        force_rebuild=False  # True로 설정 시 기존 DB 무시하고 재구축
+        folder_path=None,
+        force_rebuild=False,
+        use_local=USE_LOCAL_EMBEDDING
     )
