@@ -65,7 +65,7 @@ class LocalEmbeddings(Embeddings):
         
         if not out:
             # 텍스트 미리보기 (처음 100자만 표시, 잘린 경우 표시)
-            preview = texts[0] if texts else ""
+            preview = texts[0] if texts and len(texts) > 0 else "빈 텍스트"
             if len(preview) > 100:
                 preview = preview[:100] + "... (잘림)"
             raise RuntimeError(f"임베딩 API 실패: {preview}")
@@ -107,8 +107,8 @@ def get_word_files(folder_path: str) -> List[str]:
     
     extensions = ('.docx', '.doc')
     files = [
-        f for f in os.listdir(folder_path_obj) 
-        if f.lower().endswith(extensions) and not f.startswith('~$')
+        f.name for f in folder_path_obj.iterdir()
+        if f.is_file() and f.name.lower().endswith(extensions) and not f.name.startswith('~$')
     ]
     return sorted(files)
 
@@ -433,20 +433,22 @@ def process_folder(
             folder_path_obj = Path(folder_path).resolve()
             file_path = (folder_path_obj / file).resolve()
             
-            # 경로 검증: 부모 디렉토리가 folder_path 내에 있는지 확인
-            if folder_path_obj not in file_path.parents and folder_path_obj != file_path.parent:
+            # 경로 검증: 파일이 folder_path 내에 있는지 확인 (directory traversal 방지)
+            try:
+                file_path.relative_to(folder_path_obj)
+            except ValueError:
                 print(f"  ❌ 보안: 허용되지 않은 경로 - {file}")
                 continue
             
             # 파일별 DB 경로 설정
             file_base_name = os.path.splitext(file)[0]
             db_path = f"{db_base_path}_{file_base_name}"
+            db_path_obj = Path(db_path).resolve()
             docstore_path = "docstore.pkl"
             
             # 기존 DB가 있고 재구축 안 할 경우
-            db_path_obj = Path(db_path).resolve()
             if db_path_obj.exists() and not force_rebuild:
-                print(f"  기존 DB 발견, 로드합니다: {db_path}")
+                print(f"  기존 DB 발견, 로드합니다: {db_path_obj}")
                 retriever = load_retriever(str(db_path_obj), docstore_path, embedding_model)
             else:
                 # 문서 처리 파이프라인
