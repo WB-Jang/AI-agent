@@ -30,6 +30,9 @@ EMBEDDING_MODEL_NAME = "text-embedding-3-small"  # 더 저렴하고 빠른 모�
 LLM_MODEL_NAME = "gpt-3.5-turbo"
 USE_LOCAL_EMBEDDING = False  # True로 설정 시 로컬 서버 사용
 LOCAL_EMBEDDING_SERVER = "http://127.0.0.1:8081"  # 로컬 임베딩 서버 주소
+LOCAL_EMBEDDING_TIMEOUT = 45  # 로컬 임베딩 서버 타임아웃 (초)
+ERROR_PREVIEW_LENGTH = 100  # 에러 메시지에 표시할 텍스트 미리보기 길이
+TEMP_FILE_PREFIX = '~$'  # 임시 파일 접두사 (Word/Excel 등)
 
 # ==========================================
 # 로컬 임베딩 모델 클래스 (from _faiss.py)
@@ -52,7 +55,7 @@ class LocalEmbeddings(Embeddings):
                 r = requests.post(
                     f"{self.server_url}/v1/embeddings", 
                     json={"model": "bge-m3", "input": t}, 
-                    timeout=45
+                    timeout=LOCAL_EMBEDDING_TIMEOUT
                 )
                 if r.ok and "data" in r.json():
                     vecs = r.json()["data"][0]["embedding"]
@@ -64,10 +67,10 @@ class LocalEmbeddings(Embeddings):
                 pass
         
         if not out:
-            # 텍스트 미리보기 (처음 100자만 표시, 잘린 경우 표시)
-            preview = texts[0] if texts and len(texts) > 0 else "빈 텍스트"
-            if len(preview) > 100:
-                preview = preview[:100] + "... (잘림)"
+            # 텍스트 미리보기 (설정된 길이만 표시, 잘린 경우 표시)
+            preview = texts[0] if texts else "빈 텍스트"
+            if len(preview) > ERROR_PREVIEW_LENGTH:
+                preview = preview[:ERROR_PREVIEW_LENGTH] + "... (잘림)"
             raise RuntimeError(f"임베딩 API 실패: {preview}")
         
         return np.vstack(out).astype("float32")
@@ -108,7 +111,7 @@ def get_word_files(folder_path: str) -> List[str]:
     extensions = ('.docx', '.doc')
     files = [
         f.name for f in folder_path_obj.iterdir()
-        if f.is_file() and f.name.lower().endswith(extensions) and not f.name.startswith('~$')
+        if f.is_file() and f.name.lower().endswith(extensions) and not f.name.startswith(TEMP_FILE_PREFIX)
     ]
     return sorted(files)
 
