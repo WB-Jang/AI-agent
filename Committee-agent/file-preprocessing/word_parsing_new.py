@@ -60,11 +60,15 @@ class LocalEmbeddings(Embeddings):
                     v /= (np.linalg.norm(v) + 1e-12)  # 정규화
                     out.append(v)
             except Exception as e:
-                print(f"⚠️ 임베딩 실패: {e}")
+                print(f"⚠️ 임베딩 실패 (텍스트 길이: {len(t)}자): {e}")
                 pass
         
         if not out:
-            raise RuntimeError(f"임베딩 API 실패: {texts[:100]}")
+            # 텍스트 미리보기 (처음 100자만 표시, 잘린 경우 표시)
+            preview = texts[0] if texts else ""
+            if len(preview) > 100:
+                preview = preview[:100] + "... (잘림)"
+            raise RuntimeError(f"임베딩 API 실패: {preview}")
         
         return np.vstack(out).astype("float32")
     
@@ -82,10 +86,28 @@ class LocalEmbeddings(Embeddings):
 # 파일 탐색 기능 (from word2pdf.py)
 # ==========================================
 def get_word_files(folder_path: str) -> List[str]:
-    """폴더 내의 .docx/.doc 파일 리스트를 반환"""
+    """
+    폴더 내의 .docx/.doc 파일 리스트를 반환
+    
+    Args:
+        folder_path: 검색할 폴더 경로
+        
+    Returns:
+        정렬된 파일 이름 리스트
+        
+    Raises:
+        ValueError: 폴더 경로가 유효하지 않은 경우
+    """
+    # 경로 검증
+    folder_path_obj = Path(folder_path).resolve()
+    if not folder_path_obj.exists():
+        raise ValueError(f"폴더가 존재하지 않습니다: {folder_path}")
+    if not folder_path_obj.is_dir():
+        raise ValueError(f"폴더가 아닙니다: {folder_path}")
+    
     extensions = ('.docx', '.doc')
     files = [
-        f for f in os.listdir(folder_path) 
+        f for f in os.listdir(folder_path_obj) 
         if f.lower().endswith(extensions) and not f.startswith('~$')
     ]
     return sorted(files)
@@ -407,7 +429,14 @@ def process_folder(
         print(f"\n[{i}/{len(files)}] 처리 중: {file}")
         
         try:
-            file_path = os.path.join(folder_path, file)
+            # 안전한 파일 경로 생성
+            folder_path_obj = Path(folder_path).resolve()
+            file_path = (folder_path_obj / file).resolve()
+            
+            # 경로 검증: 부모 디렉토리가 folder_path 내에 있는지 확인
+            if folder_path_obj not in file_path.parents and folder_path_obj != file_path.parent:
+                print(f"  ❌ 보안: 허용되지 않은 경로 - {file}")
+                continue
             
             # 파일별 DB 경로 설정
             file_base_name = os.path.splitext(file)[0]
@@ -415,12 +444,13 @@ def process_folder(
             docstore_path = "docstore.pkl"
             
             # 기존 DB가 있고 재구축 안 할 경우
-            if os.path.exists(db_path) and not force_rebuild:
+            db_path_obj = Path(db_path).resolve()
+            if db_path_obj.exists() and not force_rebuild:
                 print(f"  기존 DB 발견, 로드합니다: {db_path}")
-                retriever = load_retriever(db_path, docstore_path, embedding_model)
+                retriever = load_retriever(str(db_path_obj), docstore_path, embedding_model)
             else:
                 # 문서 처리 파이프라인
-                raw_docs = load_document(file_path)
+                raw_docs = load_document(str(file_path))
                 processed_texts, raw_tables = parse_document_structure(raw_docs)
                 table_summaries = summarize_tables(raw_tables, llm)
                 
@@ -433,7 +463,7 @@ def process_folder(
                 )
                 
                 # 저장
-                save_retriever(retriever, db_path, docstore_path)
+                save_retriever(retriever, str(db_path_obj), docstore_path)
             
             retrievers[file] = retriever
             print(f"  ✓ 완료: {file}")
@@ -493,9 +523,10 @@ def main(
         
         else:
             # 단일 문서 처리 (기존 로직)
-            if os.path.exists(DB_PATH) and not force_rebuild:
+            db_path_obj = Path(DB_PATH).resolve()
+            if db_path_obj.exists() and not force_rebuild:
                 print("기존 DB 발견, 로드합니다.")
-                retriever = load_retriever(DB_PATH, DOCSTORE_PATH, embedding_model)
+                retriever = load_retriever(str(db_path_obj), DOCSTORE_PATH, embedding_model)
             else:
                 # 문서 처리 파이프라인
                 raw_docs = load_document(doc_path)
