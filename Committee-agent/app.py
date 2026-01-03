@@ -42,7 +42,7 @@ def read_pdf(file):
     return text
 
 def get_proofreading_chain(api_key):
-    llm = ChatOpenAI(model="gpt-5-mini", temperature=0, openai_api_key=api_key)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key)
     template = """
     당신은 한국어 교정 전문가입니다. 아래 텍스트에서 오타, 비문, 어색한 표현을 찾아주세요.
 
@@ -160,6 +160,9 @@ def main():
                                 # 하이라이팅 함수 호출
                                 highlighted_text, errors = highlight_errors(content, response_json)
 
+                                # 결과에 섹션 추가 (오류 목록 포함)
+                                results.append({"title": title, "errors": errors})
+
                                 # 1. 글자가 커지는 것을 막기 위해 특수문자 처리 함수 통과
                                 safe_highlighted = escape_markdown_special_chars(highlighted_text)
 
@@ -177,7 +180,7 @@ def main():
                                 full_highlighted_content.append(section_html)
 
                             except Exception as e:
-                                results.append({"title": title, "correction": f"에러: {e}"})
+                                results.append({"title": title, "errors": [], "correction": f"에러: {e}"})
                                 full_highlighted_content.append(f"<h4>{title}</h4>{content}<br>") # 에러 시 원본 유지
 
                             progress_bar.progress((i + 1) / len(sections))

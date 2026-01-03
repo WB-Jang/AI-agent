@@ -35,7 +35,7 @@ def highlight_errors(original_text, analysis_result_json):
                 pattern = escaped_target.replace(r"\ ", r"\s+")
 
                 # HTML 태그로 감싸기 위한 정규식 치환
-                replacement = f"<span style='background-color: #ffdce0; color: #d8000c; font-weight: bold; padding: 2px 4px; border-radius: 4px;'>\g<0></span>"
+                replacement = r"<span style='background-color: #ffdce0; color: #d8000c; font-weight: bold; padding: 2px 4px; border-radius: 4px;'>\g<0></span>"
 
                 # 원본 텍스트가 이미 HTML 태그 등으로 오염되지 않았다고 가정하고 수행
                 highlighted_text = re.sub(pattern, replacement, highlighted_text)
